@@ -1,125 +1,30 @@
-import tkinter as tk
-from tkinter import messagebox
-import threading
-import time
-import os
-import sys
-from pynput import keyboard
+name: Build EXE
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-# ===================== 图片路径适配函数（打包exe/源码都能用） =====================
-def get_img_path(img_name):
-    if hasattr(sys, "_MEIPASS"):
-        base = sys._MEIPASS
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, img_name)
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
 
-class DesktopPet:
-    def __init__(self, win):
-        self.win = win
-        self.win.title("桌面宠物")
-        # 无边框窗口，置顶
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-        # 宠物状态
-        self.is_beast_mode = False  # False女孩，True兽态
-        self.last_input_time = time.time()
-        self.start_time = time.time()  # 饥饿计时起点
+      - name: Install
+        run: |
+          pip install pyinstaller pillow pynput
 
-        # 窗口拖拽变量
-        self.x_offset = 0
-        self.y_offset = 0
+      - name: Build exe
+        run: |
+          pyinstaller -w main.py --add-data "*.png;."
 
-        # 加载图片
-        self.img_girl_body = tk.PhotoImage(file=get_img_path("girl_body.png"))
-        self.img_beast_body = tk.PhotoImage(file=get_img_path("beast_body.png"))
-        self.img_girl_hand = tk.PhotoImage(file=get_img_path("girl_hand.png"))
-        self.img_beast_hand = tk.PhotoImage(file=get_img_path("beast_hand.png"))
-
-        # 显示图片标签
-        self.label = tk.Label(win, image=self.img_girl_body, bg="black")
-        self.label.pack()
-
-        # ========== 绑定鼠标拖拽事件 ==========
-        self.label.bind("<ButtonPress-1>", self.on_start_move)
-        self.label.bind("<B1-Motion>", self.on_moving)
-        self.label.bind("<ButtonRelease-1>", self.on_stop_move)
-
-        # 启动键盘监听线程（监听按键，检测输入法切换）
-        threading.Thread(target=self.listen_keyboard, daemon=True).start()
-        # 启动空闲+饥饿检测线程
-        threading.Thread(target=self.idle_check_loop, daemon=True).start()
-        # 宠物绕圈移动线程
-        self.walk_running = False
-
-    # ========== 拖拽窗口函数 ==========
-    def on_start_move(self, event):
-        self.x_offset = event.x
-        self.y_offset = event.y
-
-    def on_moving(self, event):
-        x = self.win.winfo_x() + event.x - self.x_offset
-        y = self.win.winfo_y() + event.y - self.y_offset
-        self.win.geometry(f"+{x}+{y}")
-
-    def on_stop_move(self, event):
-        self.x_offset = None
-        self.y_offset = None
-
-    # ========== 切换宠物形象 ==========
-    def switch_image(self, beast_mode):
-        self.is_beast_mode = beast_mode
-        if beast_mode:
-            self.label.config(image=self.img_beast_body)
-        else:
-            self.label.config(image=self.img_girl_body)
-
-    # ========== 键盘监听 ==========
-    def listen_keyboard(self):
-        def on_press(key):
-            # 更新最后输入时间
-            self.last_input_time = time.time()
-            try:
-                # Alt+Shift 输入法切换快捷键，切换形象
-                if key == keyboard.Key.shift:
-                    self.switch_image(not self.is_beast_mode)
-            except Exception:
-                pass
-
-        listener = keyboard.Listener(on_press=on_press)
-        listener.start()
-
-    # ========== 空闲检测、饥饿计时 ==========
-    def idle_check_loop(self):
-        while True:
-            time.sleep(1)
-            # 超过30秒无按键，切兽态，开始绕圈
-            idle_time = time.time() - self.last_input_time
-            if idle_time > 30 and not self.is_beast_mode:
-                self.switch_image(True)
-                if not self.walk_running:
-                    threading.Thread(target=self.pet_walk_loop, daemon=True).start()
-
-            # 60分钟饥饿检测，弹出投喂提示
-            hungry_time = time.time() - self.start_time
-            if hungry_time >= 3600:
-                messagebox.showinfo("饿啦", "我要吃饭！请投喂文件夹！")
-                self.start_time = time.time()
-
-    # ========== 宠物在桌面绕圈移动 ==========
-    def pet_walk_loop(self):
-        self.walk_running = True
-        step = 3
-        while self.is_beast_mode:
-            current_x = self.win.winfo_x()
-            current_y = self.win.winfo_y()
-            self.win.geometry(f"+{current_x + step}+{current_y}")
-            step = -step
-            time.sleep(0.8)
-        self.walk_running = False
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    pet = DesktopPet(root)
-    root.mainloop()
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopPet
+          path: dist/
