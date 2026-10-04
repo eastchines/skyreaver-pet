@@ -19,9 +19,9 @@ jobs:
           pip install pyinstaller pillow pynput
       - name: Build exe
         run: |
-          pyinstaller -w -F main.py
+          pyinstaller -w main.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DesktopPet
-          path: dist/*.exe
+          path: dist/
