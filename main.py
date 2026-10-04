@@ -1,285 +1,144 @@
-# -*- coding: utf-8 -*-
-"""
-====================================================
-  SkyReaver 桌面宠物助手（互动加强版）
-====================================================
-新增互动：
-  1. 闲置绕圈：一段时间没按键，自动切回兽态，离开键盘位置，
-     在窗口内绕圈走动（“离开键盘绕圈圈”）
-  2. 饥饿计时：吃饱后 60 分钟会饿；饿了会弹出文字气泡“我要吃饭！”
-  3. 投喂：右键宠物 → “投喂文件夹…”，选中一个文件夹让它“吃掉”，
-     饥饿立即重置（再管 60 分钟）
-  4. 保留原有功能：手跟按键、空格、输入法切换形象
-
-运行环境：Windows + Python 3.8+，依赖 pip install pynput pywin32
-====================================================
-"""
-import sys
-import os
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import pynput.keyboard
+import threading
 import time
 import ctypes
-import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from pynput import keyboard
+import os
 
+# ========== 配置参数 ==========
+HUNGER_TIME = 3600  # 饥饿时间 3600秒 = 1小时
+IDLE_TIME = 30  # 闲置多少秒变兽态
+PET_SPEED = 2  # 绕圈移动速度
+# 图片文件
+IMG_NORMAL_BODY = "girl_body.png"
+IMG_NORMAL_HAND = "girl_hand.png"
+IMG_BEAST_BODY = "beast_body.png"
+IMG_BEAST_HAND = "beast_hand.png"
 
-def resource_path(relative_path):
-    """打包成 exe 后也能正确找到图片资源"""
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-
-
-# ====================== 可调配置区 ======================
-IMG_BEAST_BODY = resource_path("beast_body.png")
-IMG_BEAST_HAND = resource_path("beast_hand.png")
-IMG_GIRL_BODY  = resource_path("girl_body.png")
-IMG_GIRL_HAND  = resource_path("girl_hand.png")
-
-CANVAS_W = 780          # 窗口宽度（加大，给绕圈留空间）
-CANVAS_H = 520          # 窗口高度
-
-# 身体在“工作态”时的位置（画布左上角锚点）
-BODY_ACTIVE_X, BODY_ACTIVE_Y = 180, 60
-
-# 手悬空 / 连接点 / 键位（工作态用，坐标相对身体位置）
-IDLE_HAND   = {"beast": (300, 90), "girl": (300, 90)}
-KEY_POS = {
-    "q": (140, 250), "w": (168, 252), "e": (196, 256), "r": (220, 259),
-    "t": (244, 261), "y": (266, 261), "u": (288, 262),
-    "a": (142, 282), "s": (165, 284), "d": (188, 286), "f": (212, 289),
-    "g": (236, 290), "h": (258, 291), "j": (280, 291),
-    "z": (146, 300), "x": (167, 302), "c": (191, 304), "v": (214, 305),
-    "b": (236, 306), "n": (258, 307), "m": (280, 307),
-    "space": (170, 322),
-}
-
-# 闲置判定：超过多少秒没按键盘 → 进入绕圈
-IDLE_SECONDS = 10
-# 绕圈矩形路径（身体左上角可到达的范围，画布坐标）
-WALK_MIN_X, WALK_MIN_Y = 20, 30
-WALK_MAX_X = CANVAS_W - 360
-WALK_MAX_Y = CANVAS_H - 360
-# 绕圈速度（每帧移动的像素）
-WALK_SPEED = 2.0
-
-# 饥饿周期（秒）：吃饱后多久会饿
-HUNGRY_MINUTES = 60
-HUNGRY_SECONDS = HUNGRY_MINUTES * 60
-
-CN_LAYOUT = 0x0804      # 简体中文输入法
-SMOOTH = 0.35           # 手移动平滑度
-FRAME_MS = 20           # 主循环帧间隔
-# ======================================================
-
+# 读取Windows当前输入法
+def get_current_input_method():
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    threadid = user32.GetWindowThreadProcessId(hwnd, 0)
+    klid = ctypes.windll.kernel32.GetKeyboardLayout(threadid)
+    return klid
 
 class DesktopPet:
     def __init__(self, root):
         self.root = root
-        self.root.title("SkyReaver 桌面助手")
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", "black")
-        self.root.geometry(f"{CANVAS_W}x{CANVAS_H}+120+150")
+        self.root.overrideredirect(True) #无边框
+        self.root.attributes("-topmost", True) #置顶
+        self.root.attributes("-transparentcolor", "white") #透明底色
 
-        self.canvas = tk.Canvas(root, width=CANVAS_W, height=CANVAS_H,
-                                bg="black", highlightthickness=0)
-        self.canvas.pack()
-
-        # ---------- 状态 ----------
-        self.mode = "beast"            # beast / girl
-        self.state = "active"          # active(工作) / idle(绕圈)
-        self.hungry = False            # 是否饥饿
-        self.hungry_banner = None      # 饥饿气泡的 canvas 对象
-
-        self.body_x, self.body_y = BODY_ACTIVE_X, BODY_ACTIVE_Y
-        self.hand_x, self.hand_y = IDLE_HAND["beast"]
-        self.hand_tx, self.hand_ty = IDLE_HAND["beast"]
-
-        # 闲置 / 饥饿计时
-        self.last_input = time.time()
-        self.fed_time = time.time()    # 吃饱时间点（启动即视为吃饱）
-
-        # 绕圈参数
-        self.walk_phase = 0.0
-
-        # ---------- 素材 ----------
-        self.images = {}
-        self._load_images()
-
-        # 身体层（绘制层级在底层）
-        self.body_id = self.canvas.create_image(self.body_x, self.body_y,
-                                                image=self.images["body"], anchor="nw")
-        # 手层（绘制在上层）
-        self.hand_id = self.canvas.create_image(self.hand_x, self.hand_y,
-                                                image=self.images["hand"])
-
-        # ---------- 右键菜单（投喂 / 退出） ----------
-        self.menu = tk.Menu(root, tearoff=0)
-        self.menu.add_command(label="投喂文件夹…", command=self.feed_folder)
-        self.menu.add_command(label="立即吃饱（测试）", command=self.feed_now)
-        self.menu.add_separator()
-        self.menu.add_command(label="退出", command=root.destroy)
-        self.canvas.bind("<Button-3>", self._pop_menu)
-
-        # ---------- 线程 ----------
-        self.listener = keyboard.Listener(on_press=self.on_press,
-                                          on_release=self.on_release)
-        self.listener.start()
-        threading.Thread(target=self.watch_input_method, daemon=True).start()
-
-        # ---------- 主循环 ----------
-        self._tick()
-
-    # ================= 素材 =================
-    def _load_images(self):
-        if self.mode == "beast":
-            self.images["body"] = tk.PhotoImage(file=IMG_BEAST_BODY)
-            self.images["hand"] = tk.PhotoImage(file=IMG_BEAST_HAND)
-        else:
-            self.images["body"] = tk.PhotoImage(file=IMG_GIRL_BODY)
-            self.images["hand"] = tk.PhotoImage(file=IMG_GIRL_HAND)
-
-    def switch_mode(self, mode):
-        if mode == self.mode:
-            return
-        self.mode = mode
-        self._load_images()
-        self.canvas.itemconfig(self.body_id, image=self.images["body"])
-        self.canvas.itemconfig(self.hand_id, image=self.images["hand"])
-
-    # ================= 键盘 =================
-    def on_press(self, key):
-        self.last_input = time.time()
-        if self.state == "idle":
-            return  # 绕圈中不响应按键定位
-        try:
-            ch = key.char.lower()
-            if ch in KEY_POS:
-                self.hand_tx, self.hand_ty = KEY_POS[ch]
-        except AttributeError:
-            if key == keyboard.Key.space:
-                self.hand_tx, self.hand_ty = KEY_POS["space"]
-
-    def on_release(self, key):
-        self.last_input = time.time()
-        if self.state == "active":
-            self.hand_tx, self.hand_ty = IDLE_HAND[self.mode]
-
-    # ================= 输入法 =================
-    def get_layout(self):
-        return ctypes.windll.user32.GetKeyboardLayout(0) & 0xFFFF
-
-    def watch_input_method(self):
-        while True:
-            if ctypes.windll.user32.GetKeyboardLayout(0) & 0xFFFF == CN_LAYOUT:
-                self.switch_mode("girl")
-            else:
-                self.switch_mode("beast")
-            threading.Event().wait(0.3)
-
-    # ================= 投喂 =================
-    def _pop_menu(self, event):
-        try:
-            self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
-
-    def feed_folder(self):
-        folder = filedialog.askdirectory(title="选择一个文件夹，让宠物吃掉")
-        if not folder:
-            return
-        self._eat(f"已吃掉：{os.path.basename(folder)}")
-
-    def feed_now(self):
-        self._eat("吃饱啦！")
-
-    def _eat(self, msg):
-        self.fed_time = time.time()
+        # 拖拽变量
+        self.drag_x = 0
+        self.drag_y = 0
+        # 状态
+        self.is_beast = False
+        self.last_input = get_current_input_method()
+        self.last_active_time = time.time()
+        self.start_hunger_time = time.time()
         self.hungry = False
-        self._show_banner(msg, 2.0)
 
-    # ================= 主循环 =================
-    def _tick(self):
-        now = time.time()
+        # 加载图片
+        self.img_girl_body = ImageTk.PhotoImage(Image.open(IMG_NORMAL_BODY))
+        self.img_girl_hand = ImageTk.PhotoImage(Image.open(IMG_NORMAL_HAND))
+        self.img_beast_body = ImageTk.PhotoImage(Image.open(IMG_BEAST_BODY))
+        self.img_beast_hand = ImageTk.PhotoImage(Image.open(IMG_BEAST_HAND))
 
-        # ---- 1. 状态切换：闲置 → 绕圈 ----
-        idle_now = (now - self.last_input) > IDLE_SECONDS
-        if idle_now and self.state == "active":
-            self.state = "idle"
-            self.switch_mode("beast")        # 绕圈时固定用兽态
-        elif not idle_now and self.state == "idle":
-            self.state = "active"
-            self.body_x, self.body_y = BODY_ACTIVE_X, BODY_ACTIVE_Y
-            self.hand_tx, self.hand_ty = IDLE_HAND[self.mode]
+        self.label = tk.Label(root, image=self.img_girl_body, bg="white")
+        self.label.pack()
 
-        # ---- 2. 绕圈运动 ----
-        if self.state == "idle":
-            self.walk_phase += WALK_SPEED * FRAME_MS / 1000.0
-            self.body_x, self.body_y = self._walk_pos(self.walk_phase)
+        # ========== 绑定拖拽事件【解决无法拖动】 ==========
+        self.label.bind("<ButtonPress-1>", self.start_drag)
+        self.label.bind("<B1-Motion>", self.on_drag)
+        self.label.bind("<ButtonRelease-1>", self.stop_drag)
 
-        # ---- 3. 饥饿判定 ----
-        if not self.hungry and (now - self.fed_time) > HUNGRY_SECONDS:
-            self.hungry = True
-            self._show_banner("我要吃饭！", None)   # 常驻提示
+        # 启动后台线程
+        threading.Thread(target=self.input_monitor, daemon=True).start()
+        threading.Thread(target=self.idle_loop, daemon=True).start()
+        threading.Thread(target=self.hunger_check, daemon=True).start()
+        threading.Thread(target=self.key_listen, daemon=True).start()
 
-        # ---- 4. 手跟随 ----
-        if self.state == "active":
-            self.hand_x += (self.hand_tx - self.hand_x) * SMOOTH
-            self.hand_y += (self.hand_ty - self.hand_y) * SMOOTH
+    # =====拖拽函数=====
+    def start_drag(self, event):
+        self.drag_x = event.x
+        self.drag_y = event.y
+    def on_drag(self, event):
+        dx = event.x - self.drag_x
+        dy = event.y - self.drag_y
+        x = self.root.winfo_x() + dx
+        y = self.root.winfo_y() + dy
+        self.root.geometry(f"+{x}+{y}")
+        self.last_active_time = time.time() #拖动视为活跃，重置闲置计时
+    def stop_drag(self, event):
+        self.drag_x, self.drag_y = None, None
+
+    # =====输入法轮询，切换图片=====
+    def input_monitor(self):
+        while True:
+            now_input = get_current_input_method()
+            if now_input != self.last_input:
+                self.last_input = now_input
+                self.switch_image()
+                self.last_active_time = time.time()
+            time.sleep(0.8)
+
+    def switch_image(self):
+        if self.is_beast:
+            self.label.config(image=self.img_beast_body)
         else:
-            # 绕圈时手跟着身体走，停在身体右侧
-            self.hand_x = self.body_x + 300
-            self.hand_y = self.body_y + 90
+            self.label.config(image=self.img_girl_body)
 
-        # ---- 绘制 ----
-        self.canvas.coords(self.body_id, self.body_x, self.body_y)
-        self.canvas.coords(self.hand_id, self.hand_x, self.hand_y)
+    # =====闲置检测，闲置超时变兽态，自动绕圈=====
+    def idle_loop(self):
+        direction = 1
+        while True:
+            idle_sec = time.time() - self.last_active_time
+            if idle_sec > IDLE_TIME:
+                if not self.is_beast:
+                    self.is_beast = True
+                    self.switch_image()
+                # 兽态绕圈移动
+                x = self.root.winfo_x()
+                x += PET_SPEED * direction
+                if x > 1600 or x < 0:
+                    direction *= -1
+                self.root.geometry(f"+{x}+{self.root.winfo_y()}")
+            else:
+                if self.is_beast:
+                    self.is_beast = False
+                    self.switch_image()
+            time.sleep(0.05)
 
-        self.root.after(FRAME_MS, self._tick)
+    # =====饥饿检测=====
+    def hunger_check(self):
+        while True:
+            if time.time() - self.start_hunger_time > HUNGER_TIME and not self.hungry:
+                self.hungry = True
+                messagebox.showinfo("提示", "我要吃饭！请投喂文件夹")
+            time.sleep(10)
+    def feed(self):
+        self.start_hunger_time = time.time()
+        self.hungry = False
 
-    def _walk_pos(self, phase):
-        """沿窗口内侧矩形路径绕圈，返回身体左上角坐标"""
-        w = WALK_MAX_X - WALK_MIN_X
-        h = WALK_MAX_Y - WALK_MIN_Y
-        # 4 段：上边 → 右边 → 下边 → 左边
-        seg = phase % 4.0
-        if seg < 1:
-            t = seg
-            return (WALK_MIN_X + w * t, WALK_MIN_Y)
-        elif seg < 2:
-            t = seg - 1
-            return (WALK_MAX_X, WALK_MIN_Y + h * t)
-        elif seg < 3:
-            t = seg - 2
-            return (WALK_MAX_X - w * t, WALK_MAX_Y)
-        else:
-            t = seg - 3
-            return (WALK_MIN_X, WALK_MAX_Y - h * t)
-
-    def _show_banner(self, text, duration):
-        """在窗口顶部显示一条文字气泡；duration=None 表示常驻"""
-        if self.hungry_banner:
-            self.canvas.delete(self.hungry_banner)
-            self.hungry_banner = None
-        self.hungry_banner = self.canvas.create_text(
-            CANVAS_W // 2, 24, text=text, fill="#FF5A5A",
-            font=("Microsoft YaHei", 20, "bold"))
-        if duration is not None:
-            self.root.after(int(duration * 1000),
-                            lambda: self._clear_banner(self.hungry_banner))
-
-    def _clear_banner(self, item):
-        try:
-            self.canvas.delete(item)
-            if self.hungry_banner == item:
-                self.hungry_banner = None
-        except Exception:
-            pass
-
+    # =====键盘监听，按键切换手部图片=====
+    def key_listen(self):
+        def on_press(key):
+            self.last_active_time = time.time()
+            try:
+                if key == pynput.keyboard.Key.space:
+                    self.label.config(image=self.img_girl_hand) #空格悬空手
+                else:
+                    self.label.config(image=self.img_girl_hand)
+            except:
+                pass
+        listener = pynput.keyboard.Listener(on_press=on_press)
+        listener.start()
 
 if __name__ == "__main__":
-    win = tk.Tk()
-    pet = DesktopPet(win)
-    win.mainloop()
+    root = tk.Tk()
+    pet = DesktopPet(root)
+    root.mainloop()
